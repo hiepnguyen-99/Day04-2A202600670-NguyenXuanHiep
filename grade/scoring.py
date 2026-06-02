@@ -249,12 +249,17 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Grade saved JSON output for the order-agent lab")
     parser.add_argument("--module", default="solution.agent.graph")
     parser.add_argument("--cases", default=str(ROOT_DIR / "data" / "graded_cases.json"))
-    parser.add_argument("--provider", default="google", choices=["google", "ollama"])
+    parser.add_argument("--provider", default="google", choices=["google", "ollama", "endpoint", "llm_endpoint", "openai_compatible"])
     parser.add_argument("--model-name", default=None)
     parser.add_argument("--today", default="2026-06-01")
     parser.add_argument("--pass-threshold", type=float, default=80.0)
-    parser.add_argument("--judge-provider", default=None, choices=["google", "ollama"])
+    parser.add_argument("--judge-provider", default=None, choices=["google", "ollama", "endpoint", "llm_endpoint", "openai_compatible"])
     parser.add_argument("--judge-model-name", default=None)
+    parser.add_argument(
+        "--no-llm-judge",
+        action="store_true",
+        help="Skip the LLM judge for local debugging. JSON/tool scores still run, but final score will not include judge points.",
+    )
     args = parser.parse_args()
 
     module = importlib.import_module(args.module)
@@ -263,11 +268,16 @@ def main() -> int:
 
     cases = load_cases(Path(args.cases))
     effective_judge_provider = args.judge_provider
-    if effective_judge_provider is None and any(case["weights"].get("llm_judge", 0) > 0 for case in cases):
+    if (
+        not args.no_llm_judge
+        and effective_judge_provider is None
+        and any(case["weights"].get("llm_judge", 0) > 0 for case in cases)
+    ):
         effective_judge_provider = args.provider
 
     scores: list[CaseScore] = []
-    for case in cases:
+    for index, case in enumerate(cases, start=1):
+        print(f"[{index}/{len(cases)}] running agent: {case['id']}", file=sys.stderr, flush=True)
         raw_result = module.run_agent(
             case["query"],
             provider=args.provider,
@@ -275,6 +285,17 @@ def main() -> int:
             today=args.today,
         )
         result = coerce_result(raw_result, query=case["query"], provider=args.provider, model_name=args.model_name)
+        tool_names = [tool["name"] if isinstance(tool, dict) else tool.name for tool in result.get("tool_calls", [])]
+        saved_status = "saved" if result.get("saved_order") else "not_saved"
+        print(
+            f"[{index}/{len(cases)}] agent done: {case['id']} tools={tool_names} {saved_status}",
+            file=sys.stderr,
+            flush=True,
+        )
+        if effective_judge_provider:
+            print(f"[{index}/{len(cases)}] grading + LLM judge: {case['id']}", file=sys.stderr, flush=True)
+        else:
+            print(f"[{index}/{len(cases)}] grading without LLM judge: {case['id']}", file=sys.stderr, flush=True)
         scores.append(
             grade_result(
                 result,
@@ -283,6 +304,7 @@ def main() -> int:
                 judge_model_name=args.judge_model_name,
             )
         )
+        print(f"[{index}/{len(cases)}] scored: {case['id']} = {scores[-1].score}/{scores[-1].max_score}", file=sys.stderr, flush=True)
 
     summary = summarize_scores(scores)
     print(json.dumps(summary, indent=2, ensure_ascii=False))
